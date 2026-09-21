@@ -2,7 +2,7 @@ name: Auto Renew HidenCloud
 
 on:
   workflow_dispatch:
- 
+
 permissions:
   actions: write
   contents: read
@@ -14,10 +14,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -43,9 +43,179 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           IS_PROXY: ${{ env.IS_PROXY }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
-          CRON_JOB: ${{ secrets.CRON_JOB }}          
+          CRON_JOB: ${{ secrets.CRON_JOB }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
-        
+
+      - name: 📸 仅在运行失败时上传错误截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshots
+          path: "*.png"
+          retention-days: 3
+
+      - name: ⏰ 写回 Cron-job.org（失败自动重试）
+        if: success()
+        env:
+          CRON_JOB: ${{ secrets.CRON_JOB }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import random
+          import time
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          cron_env = os.environ.get("CRON_JOB", "").strip()
+          tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
+          tg_chat_id = os.environ.get("TG_CHAT_ID", "").strip()
+
+          if not cron_env:
+              print("⚠️ 未设置 CRON_JOB，跳过 Cron 写回")
+              raise SystemExit(0)
+
+          # CRON_JOB 格式：API_KEY,JOB_ID
+          parts = [x.strip() for x in cron_env.split(",", 1)]
+          if len(parts) != 2 or not parts[0] or not parts[1]:
+              print("❌ CRON_JOB 格式错误，应为：API_KEY,JOB_ID")
+              raise SystemExit(1)
+
+          api_key, job_id = parts
+          endpoint = f"https://api.cron-job.org/jobs/{job_id}"
+          tz = ZoneInfo("Asia/Shanghai")
+
+          def tg_notify(text):
+              if not tg_token or not tg_chat_id:
+                  print("⚠️ TG_BOT_TOKEN / TG_CHAT_ID 未设置，跳过 TG 通知")
+                  return
+              url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+              payload = json.dumps({
+                  "chat_id": tg_chat_id,
+                  "text": text
+              }).encode()
+              req = urllib.request.Request(
+                  url,
+                  data=payload,
+                  headers={"Content-Type": "application/json"},
+                  method="POST"
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      print(f"📨 Telegram 通知状态：{r.status}")
+              except Exception as e:
+                  print(f"⚠️ Telegram 通知失败：{e}")
+
+          def update_cron(delay_minutes=0):
+              now = datetime.now(tz)
+              # 正常情况下随机延后 1~60 分钟；最少保证 5 分钟后执行。
+              if delay_minutes > 0:
+                  target = now + timedelta(minutes=delay_minutes)
+              else:
+                  random_delay = random.randint(1, 60)
+                  target = now + timedelta(minutes=max(5, random_delay))
+
+              # cron-job.org 的 wdays: 0=Sunday ... 6=Saturday
+              wday = (target.weekday() + 1) % 7
+
+              schedule = {
+                  "timezone": "Asia/Shanghai",
+                  "expiresAt": 0,
+                  "hours": [target.hour],
+                  "mdays": [-1],
+                  "minutes": [target.minute],
+                  "months": [-1],
+                  "wdays": [wday]
+              }
+
+              payload = json.dumps({"job": {"schedule": schedule}}).encode()
+              headers = {
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json"
+              }
+
+              for attempt in range(1, 4):
+                  req = urllib.request.Request(
+                      endpoint,
+                      data=payload,
+                      headers=headers,
+                      method="PATCH"
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          body = resp.read().decode("utf-8", errors="replace")
+                          if 200 <= resp.status < 300:
+                              print(
+                                  f"✅ Cron 写回成功：{target.strftime('%Y-%m-%d %H:%M:%S')} "
+                                  f"(北京时间)，第 {attempt} 次尝试"
+                              )
+                              print(f"📋 API 返回：{body or '{}'}")
+                              return True, target
+                          raise RuntimeError(f"HTTP {resp.status}: {body}")
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode("utf-8", errors="replace")
+                      print(f"⚠️ Cron 写回第{attempt}次失败：HTTP {e.code}: {body}")
+
+                      if attempt >= 3:
+                          break
+
+                      if e.code == 429:
+                          retry_after = e.headers.get("Retry-After")
+                          try:
+                              wait = int(retry_after)
+                          except (TypeError, ValueError):
+                              wait = 15 * attempt
+                      else:
+                          wait = 5 * attempt
+
+                      print(f"⏳ {wait} 秒后重试...")
+                      time.sleep(wait)
+
+                  except Exception as e:
+                      print(f"⚠️ Cron 写回第{attempt}次失败：{e}")
+                      if attempt < 3:
+                          wait = 5 * attempt
+                          print(f"⏳ {wait} 秒后重试...")
+                          time.sleep(wait)
+
+              return False, None
+
+          # 正常写回：随机延后 1~60 分钟
+          ok, target = update_cron()
+
+          if ok:
+              tg_notify(
+                  "✅ HidenCloud 续期完成\n"
+                  f"⏰ 下次 Cron：{target.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）"
+              )
+          else:
+              # 连续 3 次失败后，把目标改为 10 分钟后再次执行；
+              # 同时发送 Telegram 告警。这里再次写回仍使用 3 次重试机制。
+              print("❌ Cron 连续 3 次写回失败")
+              tg_notify(
+                  "🚨 HidenCloud Cron 写回连续 3 次失败\n"
+                  "将尝试把下一次执行时间设置为 10 分钟后。"
+              )
+
+              fallback_ok, fallback_target = update_cron(delay_minutes=10)
+
+              if fallback_ok:
+                  tg_notify(
+                      "⚠️ Cron 写回恢复成功\n"
+                      f"⏰ 已设置为 10 分钟后执行："
+                      f"{fallback_target.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）"
+                  )
+              else:
+                  tg_notify(
+                      "❌ Cron 写回最终失败\n"
+                      "正常随机写回和 10 分钟兜底写回均失败，请检查 CRON_JOB / API 限流。"
+                  )
+                  raise SystemExit(1)
+          PY
 
       - name: 🧽 清理进程和临时文件
         if: always()
