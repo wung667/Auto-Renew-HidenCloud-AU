@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests,base64
+import os,re,sys,time,random,requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -11,17 +11,11 @@ except ImportError:
     from playwright.sync_api import sync_playwright
 
 # --- 环境变量 (可在Settings里设置secrets或者私库直接填写在双引号里)---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
 EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用, 建议填写
 PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 建议填写
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
 CRON_JOB     = os.environ.get('CRON_JOB') or ""      # cron-job.org: API_KEY,JOB_ID
-GH_SECRET_TOKEN = os.environ.get('GH_SECRET_TOKEN') or ""  # GitHub PAT，用于自动更新 Actions Secret
-GITHUB_REPOSITORY = os.environ.get('GITHUB_REPOSITORY') or ""  # owner/repo，由 GitHub Actions 自动提供
-COOKIE_SECRET_NAME = 'COOKIE_VALUE'
-COOKIE_NAME = 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989'
-LOGIN_METHOD = ''
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -112,110 +106,9 @@ def send_telegram_notification(status, old_due, new_due):
         return False
 
 # =========================================================
-# GitHub Actions Secret 自动刷新
-# Cookie 失效 -> 账号密码登录成功后，从浏览器当前 Cookie 中取出
-# remember_web_* 的最新值，并加密写回 GitHub Actions Secret COOKIE_VALUE。
-# 不在日志中输出 Cookie 原文。
-# =========================================================
-def get_fresh_remember_cookie(context):
-    """从当前浏览器会话获取最新 remember_web Cookie。"""
-    try:
-        cookies = context.cookies([BASE_URL])
-        for c in cookies:
-            if c.get('name') == COOKIE_NAME and c.get('value'):
-                return c.get('value')
-        # 兼容未来 Cookie 名称变化：只匹配 remember_web_ 前缀。
-        for c in cookies:
-            if str(c.get('name', '')).startswith('remember_web_') and c.get('value'):
-                return c.get('value')
-    except Exception as e:
-        log(f"⚠️ 获取最新 Cookie 失败: {e}")
-    return None
-
-
-def update_github_cookie_secret(context):
-    """把当前浏览器最新 remember_web Cookie 加密写回 GitHub Actions Secret。"""
-    if not GH_SECRET_TOKEN:
-        log("ℹ️ 未配置 GH_SECRET_TOKEN，跳过 GitHub Cookie 写回")
-        return False
-
-    repo = GITHUB_REPOSITORY.strip()
-    if not repo or '/' not in repo:
-        log("⚠️ GITHUB_REPOSITORY 未配置或格式错误，应为 owner/repo")
-        return False
-
-    fresh_cookie = get_fresh_remember_cookie(context)
-    if not fresh_cookie:
-        log("⚠️ 当前浏览器没有找到 remember_web Cookie，无法写回")
-        return False
-
-    # 避免每次都把同一个值重新写入 GitHub Secret。
-    if COOKIE_VALUE and fresh_cookie == COOKIE_VALUE:
-        log("ℹ️ 登录后 Cookie 未发生变化，无需更新 GitHub Secret")
-        return True
-
-    try:
-        from nacl.public import PublicKey, SealedBox
-    except ImportError:
-        log("❌ 缺少 PyNaCl：请在 Actions 中安装 pip install pynacl")
-        return False
-
-    owner, repo_name = repo.split('/', 1)
-    api = f"https://api.github.com/repos/{owner}/{repo_name}/actions/secrets"
-    headers = {
-        'Accept': 'application/vnd.github+json',
-        'Authorization': f'Bearer {GH_SECRET_TOKEN}',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'HidenCloud-Renew/1.0'
-    }
-
-    try:
-        # 1. 获取仓库 Actions Secret 公钥
-        r = requests.get(f"{api}/public-key", headers=headers, timeout=20,
-                         proxies=REQUESTS_PROXIES)
-        if r.status_code != 200:
-            log(f"❌ GitHub 获取 Secret 公钥失败: HTTP {r.status_code}: {(r.text or '')[:300]}")
-            return False
-        key_data = r.json()
-        public_key = key_data.get('key')
-        key_id = key_data.get('key_id')
-        if not public_key or not key_id:
-            log("❌ GitHub 公钥响应缺少 key/key_id")
-            return False
-
-        # 2. 使用 GitHub 要求的 LibSodium sealed box 加密 Cookie
-        encrypted = SealedBox(PublicKey(base64.b64decode(public_key))).encrypt(
-            fresh_cookie.encode('utf-8')
-        )
-        encrypted_value = base64.b64encode(encrypted).decode('utf-8')
-
-        # 3. 覆盖仓库 Actions Secret COOKIE_VALUE
-        payload = {
-            'encrypted_value': encrypted_value,
-            'key_id': key_id
-        }
-        r = requests.put(
-            f"{api}/{COOKIE_SECRET_NAME}",
-            headers={**headers, 'Content-Type': 'application/json'},
-            json=payload,
-            timeout=20,
-            proxies=REQUESTS_PROXIES
-        )
-        if r.status_code in (201, 204):
-            log("✅ 已将登录后最新 Cookie 加密写回 GitHub Secret COOKIE_VALUE")
-            return True
-
-        log(f"❌ GitHub Cookie 写回失败: HTTP {r.status_code}: {(r.text or '')[:500]}")
-        return False
-    except Exception as e:
-        log(f"❌ GitHub Cookie 写回异常: {e}")
-        return False
-
-
-# =========================================================
 # cron-job.org 写回
 # CRON_JOB 格式：API_KEY,JOB_ID
-# 成功续期后：下一次执行安排在成功时间 + 7 天的 17:00~23:59（Asia/Shanghai）
+# 成功续期后：下一次执行安排在成功时间 + 7 天的 08:00~08:59（Asia/Shanghai）
 # 使用 expiresAt 让该任务只执行这一次，避免按月/年重复执行。
 # =========================================================
 CRON_API_BASE = "https://api.cron-job.org"
@@ -252,9 +145,9 @@ def update_cron_job_after_success(success_time=None):
     tz = ZoneInfo(CRON_TIMEZONE)
     now = success_time.astimezone(tz) if success_time else datetime.now(tz)
 
-    # 按既有策略：成功后第 7 天，17:00~23:59 随机。
+    # 续期成功后第 7 天，上海时间 08:00~08:59 随机。
     target_date = (now + timedelta(days=7)).date()
-    hour = random.randint(17, 23)
+    hour = 8
     minute = random.randint(0, 59)
     next_run = datetime(
         target_date.year, target_date.month, target_date.day,
@@ -742,108 +635,13 @@ def solve_turnstile(page, timeout=120, success_check=None,
         pass
     return False
 
-# ===== Invoice / Login session diagnostics =====
-_REQUEST_LOG = []
-_MAX_REQUEST_LOG = 250
-
-def _short_url(url, max_len=220):
-    try:
-        from urllib.parse import urlsplit
-        u = urlsplit(url)
-        return f"{u.scheme}://{u.netloc}{u.path}"[:max_len]
-    except Exception:
-        return str(url)[:max_len]
-
-def _interesting_url(url):
-    u = (url or '').lower()
-    return any(k in u for k in ('/renew','/payment/','/invoice','/auth/login','/login','challenge-platform','challenges.cloudflare.com','/service/','csrf','logout'))
-
-def attach_network_debug(page):
-    def on_request(req):
-        try:
-            if not _interesting_url(req.url): return
-            rec={'kind':'REQ','ts':time.strftime('%H:%M:%S'),'method':req.method,'url':_short_url(req.url),'resource':req.resource_type}
-            _REQUEST_LOG.append(rec)
-            if len(_REQUEST_LOG)>_MAX_REQUEST_LOG: del _REQUEST_LOG[:-_MAX_REQUEST_LOG]
-            log(f"🌐 [REQ] {req.method} {req.resource_type} {_short_url(req.url)}")
-        except Exception: pass
-    def on_response(resp):
-        try:
-            if not _interesting_url(resp.url): return
-            location=(resp.headers or {}).get('location','')
-            rec={'kind':'RESP','ts':time.strftime('%H:%M:%S'),'status':resp.status,'url':_short_url(resp.url),'location':_short_url(location) if location else ''}
-            _REQUEST_LOG.append(rec)
-            if len(_REQUEST_LOG)>_MAX_REQUEST_LOG: del _REQUEST_LOG[:-_MAX_REQUEST_LOG]
-            if location:
-                log(f"🌐 [RESP] {resp.status} {_short_url(resp.url)} -> Location: {_short_url(location)}")
-            else:
-                log(f"🌐 [RESP] {resp.status} {_short_url(resp.url)}")
-        except Exception: pass
-    page.on('request',on_request)
-    page.on('response',on_response)
-
-def cookie_snapshot(context):
-    try:
-        cookies=context.cookies([BASE_URL])
-        return {c.get('name'):{k:c.get(k) for k in ('domain','path','httpOnly','secure','sameSite','expires')} for c in cookies}
-    except Exception as e:
-        log(f"⚠️ Cookie 快照失败: {e}")
-        return {}
-
-def log_cookie_diff(before, after, label='Cookie'):
-    b=set(before or {}); a=set(after or {})
-    added=sorted(a-b); removed=sorted(b-a)
-    changed=sorted(k for k in a&b if before.get(k)!=after.get(k))
-    log(f"🍪 {label}: 新增={added or '无'}, 删除={removed or '无'}, 属性变化={changed or '无'}")
-
-def save_login_diagnostics(page, context, prefix='invoice_login_redirect'):
-    try: page.screenshot(path=f'{prefix}.png', full_page=True)
-    except Exception: pass
-    try: Path(f'{prefix}.html').write_text(page.content(),encoding='utf-8')
-    except Exception: pass
-    try:
-        with open(f'{prefix}_network.txt','w',encoding='utf-8') as f:
-            f.write(f'URL: {page.url}\nTitle: {page.title()}\n')
-            f.write('--- interesting requests/responses ---\n')
-            for rec in _REQUEST_LOG[-150:]: f.write(repr(rec)+'\n')
-            f.write('--- cookies (names only) ---\n')
-            for name,meta in cookie_snapshot(context).items(): f.write(f'{name}: {meta}\n')
-        log(f"📦 已保存诊断: {prefix}.png / {prefix}.html / {prefix}_network.txt")
-    except Exception as e: log(f"⚠️ 保存诊断失败: {e}")
-
 def login(page):
-    global LOGIN_METHOD
-    # 1. Cookie 登录尝试
-    if COOKIE_VALUE:
-        log("📇 尝试 Cookie 登录...")
-        try:
-            page.context.add_cookies([{
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': COOKIE_VALUE,
-                'domain': 'dash.hidencloud.com',
-                'path': '/',
-                'expires': int(time.time()) + 3600 * 24 * 365,
-                'httpOnly': True,
-                'secure': True,
-                'sameSite': 'Lax'
-            }])
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8)
-            page_title = page.title()
-            log(f"📝 当前Title: {page_title}")
-            if "auth/login" not in page.url:
-                LOGIN_METHOD = "cookie"
-                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
-                return True
-            log("⚠️ Cookie 失效，切换到账号密码登录...")
-        except Exception as e:
-            log(f"⚠️ Cookie 登录出现异常: 账号密码登录...")
-
-    # 2. 账号密码登录
+    # 始终使用账号密码登录，不再使用 Cookie 登录或 Cookie 写回。
     if not EMAIL or not PASSWORD:
         log("❌ 未配置 EMAIL/PASSWORD，无法进行账号密码登录")
         return False
-    log("💣 尝试账号密码登录...")
+
+    log("💣 使用账号密码登录...")
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
 
@@ -863,7 +661,6 @@ def login(page):
             return False
 
         # --- 填写账号密码 ---
-        # 实测真实表单：input#username[name="username"] + input#password[name="password"]
         email_sel = ('input[name="username"], input#username, input[name="email"], '
                      'input[type="email"], input[name="EMAIL"]')
         pwd_sel = ('input[name="password"], input#password, '
@@ -879,11 +676,9 @@ def login(page):
         pwd_input.click()
         pwd_input.fill(PASSWORD)
 
-        # --- 按流程等待 8 秒，等第二道 Turnstile 出现 ---
+        # --- 等待第二道 Turnstile 出现 ---
         log("⏳ 输入完成，等待turnstile加载...")
         time.sleep(8)
-
-        # --- 第二道 Turnstile（若该轮流程没有出现，等待后照样继续）---
         log("🛡️ 处理第二道 Turnstile...")
         if not solve_turnstile(page, timeout=90, require_positive=True,
                                shot_on_timeout="login_turnstile2_fail.png"):
@@ -916,8 +711,7 @@ def login(page):
             log("❌ 登录失败，账号密码错误或被封禁")
             page.screenshot(path="login_fail.png")
             return False
-        LOGIN_METHOD = "password"
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
+        log("✅ 账号密码登录成功！当前已到达dashboard页面")
         return True
     except Exception as e:
         log(f"❌ 登录异常: {e}")
@@ -1033,7 +827,6 @@ def renew_service(page):
             if "/auth/login" in current:
                 log("❌ Create Invoice 后被重定向到 Login！")
                 log_cookie_diff(before_cookies,cookie_snapshot(page.context),"Create Invoice 前后 Cookie")
-                save_login_diagnostics(page,page.context,"invoice_login_redirect")
                 return False
             if time.time()-last_cookie>=3:
                 log_cookie_diff(before_cookies,cookie_snapshot(page.context),"Create Invoice Cookie"); last_cookie=time.time()
@@ -1049,11 +842,11 @@ def renew_service(page):
             log("❌ 120 秒内未进入 Invoice 页面")
             log(f"🔎 最终 URL: {page.url}"); log(f"🔎 最终 Title: {page.title()!r}")
             log_cookie_diff(before_cookies,cookie_snapshot(page.context),"最终 Cookie")
-            if "/auth/login" in page.url: save_login_diagnostics(page,page.context,"invoice_login_timeout")
-            else:
-                try:
-                    page.screenshot(path="renew_stuck_invoice.png",full_page=True); Path("renew_stuck_invoice.html").write_text(page.content(),encoding="utf-8")
-                except Exception: pass
+            try:
+                page.screenshot(path="renew_stuck_invoice.png",full_page=True)
+                Path("renew_stuck_invoice.html").write_text(page.content(),encoding="utf-8")
+            except Exception:
+                pass
             return False
 
         if page.url!=new_invoice_url: page.goto(new_invoice_url,wait_until="domcontentloaded",timeout=60000)
@@ -1075,11 +868,10 @@ def renew_service(page):
         return False
 
 def main():
-    # 检查必要环境变量
-    log(f"🔍 凭证检测: COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
-        f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
-    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
-        log("❌ 缺少登录凭证")
+    # 检查必要环境变量：仅使用账号密码登录
+    log(f"🔍 凭证检测: EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
+    if not (EMAIL and PASSWORD):
+        log("❌ 缺少 EMAIL/PASSWORD 登录凭证")
         sys.exit(1)
 
     global SERVICE_URL
@@ -1109,19 +901,9 @@ def main():
             )
             page = context.new_page()
             page.add_init_script(STEALTH_JS)
-            attach_network_debug(page)
-            log("🔎 已启用 Create Invoice / Login 网络诊断")
 
             if not login(page):
                 sys.exit(1)
-
-            # 如果本次是账号密码登录，自动把新的 remember_web Cookie 写回 GitHub Secret。
-            # 即使本次后续续费失败，Cookie 也已经可以供下一次 Actions 使用。
-            if LOGIN_METHOD == "password":
-                log("🔄 检测到本次通过账号密码登录，准备刷新 GitHub Cookie Secret...")
-                update_github_cookie_secret(context)
-            else:
-                log("ℹ️ 本次使用现有 Cookie 登录，无需刷新 Cookie Secret")
 
             # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
