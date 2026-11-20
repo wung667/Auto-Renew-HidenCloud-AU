@@ -78,6 +78,20 @@ jobs:
 
           wget -qO setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh
           test -s setup_proxy.sh
+
+          # 只修补 Actions 本次下载的临时副本，不修改远端原脚本。
+          # API 返回错误对象或非预期数据时，交由原脚本回退到 1.13.16。
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+          path = Path("setup_proxy.sh")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          matches = [i for i, line in enumerate(lines) if "latest_version=$(curl -s" in line and "api.github.com/repos/SagerNet/sing-box/releases" in line]
+          if len(matches) != 1:
+              raise SystemExit(f"无法唯一定位版本获取语句，匹配数：{len(matches)}；停止运行以避免错误修改")
+          lines[matches[0]] = 'latest_version=$(curl -fsSL --retry 2 --retry-delay 2 --max-time 20 "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r \'if type == "array" then ([.[] | select(type == "object" and .prerelease == false) | .tag_name][0] // empty) else empty end | if type == "string" then sub("^v"; "") else empty end\' 2>/dev/null || true)'
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY_PATCH
+
           bash setup_proxy.sh
 
           PROXY_SERVER="socks5h://127.0.0.1:1080"
