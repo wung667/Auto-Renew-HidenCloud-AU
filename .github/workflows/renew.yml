@@ -142,19 +142,33 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      # 更新时间到time.txt,避免6个月未更新导致工作流暂停；处理远程并发提交
       - name: 🕒 更新时间
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
-          git add time.txt
-          if git diff --cached --quiet; then
-            echo "No need to commit"
-          else
-            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
-            git push origin main
-          fi
+
+          timestamp="$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+          for attempt in $(seq 1 5); do
+            echo "🔄 推送尝试 ${attempt}/5"
+            git fetch origin main
+            git reset --hard origin/main
+            echo "$timestamp" > time.txt
+            git add time.txt
+            git commit -m "⏱️ Auto Update by Github Actions $timestamp" || {
+              echo "ℹ️ time.txt 无变更，跳过提交"
+              exit 0
+            }
+            if git push origin main; then
+              echo "✅ time.txt 更新成功"
+              exit 0
+            fi
+            echo "⚠️ 推送失败，准备重试..."
+            sleep 2
+          done
+          echo "❌ 重试5次后仍无法推送"
+          exit 1
       
       - name: 🧽 清理 GOST 和临时文件
         if: always()
